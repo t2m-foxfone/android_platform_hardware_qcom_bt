@@ -29,6 +29,8 @@
 #include <utils/Log.h>
 #include <cutils/properties.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <stdlib.h>
 #include <termios.h>
 #include "bt_vendor_qcom.h"
 #include "hci_uart.h"
@@ -474,13 +476,230 @@ done:
 **   BLUETOOTH VENDOR INTERFACE LIBRARY FUNCTIONS
 **
 *****************************************************************************/
+#ifndef T2M_PRODUCT
+#define T2M_PRODUCT
+#endif
+#if defined(T2M_PRODUCT)
+#define ADDR_PATH "/data/param"
+#define BT_ADDR_FILE_NAME "btaddr"
+#endif
+#if defined(T2M_PRODUCT)
+#define MAC_LEN                6
+#define MAC_STR_LEN    12
+#define MAC_CHAR_NUM   2
+#define MMCBLKP     "/dev/block/platform/msm_sdcc.1/by-name/traceability"
+#define BTFILE   "/data/param/btaddr"
+#define BT_OFFSET 51
+#define TRACE_RW_SIZE 512
+
+static inline int is_in_range(unsigned char c,
+               unsigned char low, unsigned char high)
+{
+    if((c > high) || (c < low)){
+        return 0;
+    }else{
+        return 1;
+    }
+}
+static int hex_strtol(const char *p)
+{
+    int i;
+    int acc = 0;
+    unsigned char c;
+
+    for(i=0; i<MAC_CHAR_NUM; i++){
+        c = (unsigned char)(p[i]);
+
+        if (is_in_range(c, '0', '9'))
+            c -= '0';
+        else if (is_in_range(c, 'a', 'f'))
+            c -= ('a' - 10);
+        else if (is_in_range(c, 'A', 'F'))
+            c -= ('A' - 10);
+        else
+            break;
+
+        acc = (acc << 4) + c;
+    }
+
+    return acc;
+}
+static int str2wa(const char *str, uint8_t *wa)
+{
+    uint8_t tmp[12] = {0};
+    int l;
+    const char *ptr = str;
+    int i;
+    int result = 0;
+
+    int MacIsZero = 1;
+
+    if(!strcmp(ptr, "000000000000")){
+        MacIsZero = 0;
+    }
+
+    if(MacIsZero == 0){
+        return -1;
+    }
+
+    for (i = MAC_LEN - 1; i < MAC_LEN; i--) {
+        l = hex_strtol(ptr);
+        if((l > 255) || (l < 0)){
+            result = -1;
+            break;
+        }
+
+        tmp[i] = l;
+
+        if(i == 0){
+            break; //done
+        }
+
+        if(ptr == NULL){
+            result = -1;
+            break;
+        }
+        ptr += 2;
+    }
+
+    if(result == 0){
+        memcpy((char *)wa, (char*)(&tmp), MAC_LEN);
+    }
+
+    return result;
+}
+
+int write_trace_partition(uint8_t* data,int offset)
+{
+  int ret=0;
+  char buf[TRACE_RW_SIZE+1];
+  int fd = open(MMCBLKP, (O_RDWR | O_NOCTTY));
+  if(fd == -1){
+        fprintf(stderr, "failed to open wlan config <%s>\n", BTFILE);
+        return -1;
+    }
+   printf("In write_trace, bt= %02x%02x%02x%02x%02x%02x",
+            data[5], data[4], data[3],
+            data[2], data[1], data[0]);
+
+
+    memset(buf, 0, sizeof(buf));
+    
+    //step1: read traceability
+    ret = read(fd, buf,TRACE_RW_SIZE);
+    if(ret <0 )
+     {
+       printf(" read mac addr err!\n");
+       close(fd);
+       return  -1;
+     }
+
+   //change mac
+   memcpy(&buf[offset], data, MAC_LEN);
+   
+   //step2: write to trace
+   lseek(fd,0,SEEK_SET);
+   ret = write(fd,buf, TRACE_RW_SIZE);
+   if(ret < 0)
+   {
+     printf(" write mac addr err!,error=%d\n",ret);
+     close(fd);
+     return  -1;
+   }
+
+     //read for test
+    lseek(fd,0,SEEK_SET);
+    memset(buf,0,TRACE_RW_SIZE);
+    ret = read(fd, buf,TRACE_RW_SIZE);
+    if(ret <0 )
+    {
+      printf(" read mac addr err!\n");
+      close(fd);
+      return  -1;
+    }
+   close(fd);
+
+   //step3: write to /data/param/
+   memset(buf,0,TRACE_RW_SIZE);
+   sprintf(buf, "%02x%02x%02x%02x%02x%02x",
+            data[5], data[4], data[3],
+            data[2], data[1], data[0]);
+    
+   fd = open(BTFILE, (O_RDWR|O_CREAT),777);
+   if(fd == -1){
+      fprintf(stderr, "failed to open wlan config <%s>\n", BTFILE);
+      system("mkdir -p /data/param");
+      fd = open(BTFILE, (O_RDWR|O_CREAT),777);
+      if(fd == -1){
+        return -1;
+      }
+   }
+   ret = write(fd,buf, sizeof(buf));
+   if( ret <0)
+     {
+             printf(" write mac addr err!,err=%d\n",ret);
+             close(fd);
+              return  -1;
+     }
+    close(fd);
+
+    if(chmod(BTFILE,S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)==-1)
+    {
+       printf("failed to chmod");
+    }
+    return 0;
+}
+#endif
 
 static int init(const bt_vendor_callbacks_t* p_cb, unsigned char *local_bdaddr)
 {
     int i;
 
     ALOGI("bt-vendor : init");
+#if defined(T2M_PRODUCT)
+    int nFd;
+    char filename[NAME_MAX];
+    int addr_len;
+    char buffer[MAC_STR_LEN+1] = {0};
+    bool bd_set = 0;
 
+    snprintf(filename, NAME_MAX, "%s/%s",ADDR_PATH,BT_ADDR_FILE_NAME);
+
+    nFd = open(filename, O_RDONLY);
+    if(nFd < 0)
+    {
+        close(nFd);
+        fprintf (stderr, "Open address file failed\n");
+    }
+    else
+    {
+        addr_len = read(nFd, &buffer, sizeof(buffer));
+        close(nFd);
+
+        if (addr_len <= 0) {
+            fprintf (stderr, "read bt address file failed\n");
+        } else{
+            buffer[MAC_STR_LEN] = '\0';
+            int ret = str2wa(buffer, local_bdaddr);
+            if (ret == 0) {
+                bd_set = 1;
+            }
+        }
+    }
+
+#endif /*TCT_NB_PRODUCT*/
+
+#if defined(T2M_PRODUCT)
+    if(bd_set != 1)
+        write_trace_partition(local_bdaddr,BT_OFFSET);
+
+#endif
+
+    ALOGI("local_bdaddr %02x:%02x:%02x:%02x:%02x:%02x",local_bdaddr[0],\
+            local_bdaddr[1],local_bdaddr[2],local_bdaddr[3],\
+            local_bdaddr[4],local_bdaddr[5]);
+
+ 
     if (p_cb == NULL)
     {
         ALOGE("init failed with no user callbacks!");
@@ -718,11 +937,13 @@ static int op(bt_vendor_opcode_t opcode, void *param)
                                     ALOGV("rome_soc_init is started");
                                     property_set("wc_transport.soc_initialized", "0");
                                     /* Always read BD address from NV file */
+#if 0
                                     if(!bt_vendor_nv_read(1, vnd_local_bd_addr))
                                     {
                                        /* Since the BD address is configured in boot time We should not be here */
                                        ALOGI("Failed to read BD address. Use the one from bluedroid stack/ftm");
                                     }
+#endif
                                     if(rome_soc_init(fd,vnd_local_bd_addr)<0) {
                                         retval = -1;
                                         userial_clock_operation(fd, USERIAL_OP_CLK_OFF);
